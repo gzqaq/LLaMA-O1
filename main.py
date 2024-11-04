@@ -20,11 +20,19 @@ import torch
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import get_peft_model, LoraConfig
+from collections import defaultdict
 
 import contextlib
 import accelerate
 accelerator = accelerate.Accelerator()
 
+def manual_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+import deepspeed
 
 @contextlib.contextmanager
 def set_left_padding(tokenizer):
@@ -96,8 +104,9 @@ def get_root(node):
     return node
 
 select_prefix = ""
-meta_action_types = ["<problem>", "<critic>", "<refine>", "<conclusion>"]
-meta_action_types_weight = [0.2, 0.4, 0.4, 0.3]
+meta_action_types = ["<expansion>","<problem>", "<critic>", "<refine>", "<conclusion>"]
+
+meta_action_type_to_index = {meta: i for i, meta in enumerate(meta_action_types)}
 
 
 
@@ -111,6 +120,58 @@ import torch
 import math
 import numpy as np
 import torch
+
+DummyTransitionProbs = np.array([[0,0,0,0,0],[0,0,0,0,0],[0,0,0,0,0],[0,0,0,0,0],[0,0,0,0,0]])
+
+def flatten_tree(node):
+    """
+    将树结构展开为列表，收集父节点、子节点和对应的值。
+    """
+    parents = []
+    children = []
+    values = []
+    nodes = [node]
+    while nodes:
+        current_node = nodes.pop()
+        current_idx = meta_action_type_to_index[current_node.meta]
+        for child in current_node.children:
+            child_idx = meta_action_type_to_index[child.meta]
+            parents.append(current_idx)
+            children.append(child_idx)
+            values.append(np.exp(child.value))
+            nodes.append(child)
+    return np.array(parents), np.array(children), np.array(values)
+
+def cal_meta_transition_probs(node):
+    num_meta_actions = len(meta_action_types)
+    # 展开树结构，获取父节点索引、子节点索引和对应的值
+    parents, children, values = flatten_tree(node)
+    # 初始化转移概率矩阵
+    TransitionProbs = np.zeros((num_meta_actions, num_meta_actions))
+    # 使用 NumPy 的高级索引和累加来更新矩阵
+    if len(parents) > 0:
+        np.add.at(TransitionProbs, (parents, children), values)
+    return TransitionProbs
+
+def np_softmax(x):
+    # 对矩阵的每一行进行 softmax 操作
+    max_vals = np.max(x, axis=1, keepdims=True)
+    e_x = np.exp(x - max_vals)
+    sum_e_x = np.sum(e_x, axis=1, keepdims=True)
+    return e_x / sum_e_x
+
+@lru_cache()
+def sampling_meta_action(node, num=1, TransitionProbs=None):
+    if TransitionProbs is None:
+        root = get_root(node)
+        TransitionProbs = cal_meta_transition_probs(root)
+    # 计算转移概率的 softmax
+    transition_probs_softmax = np_softmax(TransitionProbs)
+    i = meta_action_type_to_index[node.meta]
+    p = transition_probs_softmax[i]
+    # 进行采样
+    meta_actions = np.random.choice(meta_action_types, size=num, p=p)
+    return meta_actions
 
 # Tree Node Structure
 class TreeNode:
@@ -130,6 +191,7 @@ class TreeNode:
         self.leaf_type = ""
         self.rectify_visits = 0
         self.original_value = 0
+        self.meta = '<problem>'
 
     def add_child(self, child_node):
         self.children.append(child_node)
@@ -150,7 +212,7 @@ class TreeNode:
     def should_expand(self):
         if len(self.children) == 0:
             return True
-        if max([child.value for child in self.children]) < self.value and len(self.children) < MAX_CHILDREN_NUM:
+        if  len(self.children) < MAX_CHILDREN_NUM:#max([child.value for child in self.children]) < self.value or
             return True
         return False
 
@@ -233,16 +295,12 @@ class MCTS:
             value = self.simulate(best_child) * self.discount_factor
         node.visits += 1
         node.value += (value - node.value) / node.visits
-        # if '<critic>' in node.state:
-        #     return -node.value
-        # else:
-        #     return node.value
         return node.value
 
     def expand_node(self, node):
-        texts, policy_probs, entropys, varentropys = meta_compute_policy_head(self.model, self.tokenizer, node, self.num_candidates, envoirment=self.envoirment)
+        texts, policy_probs, entropys, varentropys, metas = meta_compute_policy_head(self.model, self.tokenizer, node, self.num_candidates, envoirment=self.envoirment)
 
-        for i, (text, policy_prob, entropy, varentropy) in enumerate(zip(texts, policy_probs, entropys, varentropys)):
+        for i, (text, policy_prob, entropy, varentropy, meta) in enumerate(zip(texts, policy_probs, entropys, varentropys, metas)):
             child_node = TreeNode(
                 state=text, parent=node, index=get_max_node_id_in_tree(node) + 1
             )
@@ -252,15 +310,16 @@ class MCTS:
             node.policy_varentropy[child_node] = varentropy
             node.add_child(child_node)
             child_node.value = self.compute_value(child_node)
-            if "<conclusion>" in child_node.state:
+            child_node.meta = meta
+            if child_node.meta == "<conclusion>":
                 if self.envoirment.compute_rule_orm_head(child_node):
                     self.patient -= 1
                     child_node.leaf_type = "successful"
                 else:
                     child_node.leaf_type = "failed"
-            # print(
-            #     f"Id:{child_node.index}, Child: {text}, Policy: {node.get_child_policy_prob(child_node)}, Value: {math.exp(child_node.value)}"
-            # )
+            print(
+                f"Id:{node.index}->{child_node.index}, Child: {text}, Policy: {node.get_child_policy_prob(child_node)}, Value: {math.exp(child_node.value)}"
+            )
         return self.select_action(node).value
 
     def compute_value(self, node):
@@ -281,7 +340,7 @@ class MCTS:
                 * np.sqrt(total_visits)
                 / (1 + child.visits)
                 + self.varentropy_lambda * node.get_child_policy_varentropy(child)
-            )
+            ) * random.uniform(0.8, 1.2)
             for child in node.children
         ]
         return node.children[np.argmax(ucb_scores)]
@@ -421,13 +480,14 @@ def compute_policy_head(model, tokenizer, selected_node, num_candidates=3, meta=
     }.get(meta, hint.format(GT=envoirment.get_ground_truth(selected_node)))
 
     inputs_string = policy_head_template(selected_node, local_id, meta, hint_text)
-    inputs = tokenizer(
-        inputs_string,
-        return_tensors="pt",
-        truncation=True,
-        padding='longest',
-        max_length=CUT_OFF_LEN
-    )
+    with set_left_truncate(tokenizer):
+        inputs = tokenizer(
+            inputs_string,
+            return_tensors="pt",
+            truncation=True,
+            padding='longest',
+            max_length=CUT_OFF_LEN
+        )
     inputs = {k: v.to(accelerator.device) for k, v in inputs.items()}
 
     outputs = accelerator.unwrap_model(model).generate(
@@ -438,7 +498,7 @@ def compute_policy_head(model, tokenizer, selected_node, num_candidates=3, meta=
         num_return_sequences=num_candidates,
         return_dict_in_generate=True,
         output_scores=True,
-        temperature=0.75,
+        temperature=1.5,
         output_logits=True,
         stop_strings=policy_head_stopping_criteria,
         tokenizer=tokenizer,
@@ -460,14 +520,15 @@ def compute_policy_head(model, tokenizer, selected_node, num_candidates=3, meta=
         if not generated_text.startswith(meta):
             generated_texts[i] = meta + generated_text
 
-    return generated_texts, normalized_probs.tolist(), normalized_entropy.tolist(), varentropy.tolist()
+    return generated_texts, normalized_probs.tolist(), normalized_entropy.tolist(), varentropy.tolist(), [meta,] * num_candidates
 
 
 # 价值头生成函数
 @torch.no_grad()
 def compute_value_head(model, tokenizer, node):
     text_for_value = value_head_template(node) + '<positive_rating>'
-    inputs = tokenizer(text_for_value, return_tensors="pt", truncation=True, padding='longest', max_length=CUT_OFF_LEN)
+    with set_left_truncate(tokenizer):
+        inputs = tokenizer(text_for_value, return_tensors="pt", truncation=True, padding='longest', max_length=CUT_OFF_LEN)
     inputs = {k: v.to(accelerator.device) for k, v in inputs.items()}
     outputs = model(**inputs, return_dict=True)
     logits = outputs.logits
@@ -487,14 +548,11 @@ def compute_value_head(model, tokenizer, node):
 # 元策略生成函数
 @torch.no_grad()
 def meta_compute_policy_head(model, tokenizer, selected_node, num_candidates=3, meta_ratio=0.5, envoirment=None):
-    if random.random() < meta_ratio:
-        return compute_policy_head(model, tokenizer, selected_node, num_candidates, envoirment=envoirment)
-
-    metas = random.choices(meta_action_types, meta_action_types_weight, k=num_candidates)
+    metas = sampling_meta_action(selected_node, num_candidates)
     generated_texts, policy_probs, normalized_entropys, varentropys = [], [], [], []
 
     for meta in metas:
-        texts, policy_probs, normalized_entropy, varentropy = compute_policy_head(model, tokenizer,
+        texts, policy_probs, normalized_entropy, varentropy, _ = compute_policy_head(model, tokenizer,
             selected_node, num_candidates=1, meta=meta, envoirment=envoirment
         )
         generated_texts.append(texts[0])
@@ -502,7 +560,7 @@ def meta_compute_policy_head(model, tokenizer, selected_node, num_candidates=3, 
         normalized_entropys.append(normalized_entropy[0])
         varentropys.append(varentropy[0])
 
-    return generated_texts, policy_probs, normalized_entropys, varentropys
+    return generated_texts, policy_probs, normalized_entropys, varentropys, metas
 
 def padding_nodes(tensor, max_len):
     feature_dim = tensor.size(-1)
@@ -746,7 +804,8 @@ class RLSPTrainer(Trainer):
         for node in traverse_tree(root_node):
             if node == root_node:
                 continue
-            
+            if node.true_value_from_tree is None:
+                continue
             reward = node.true_value_from_tree if node.true_value_from_tree is not None else node.value
             advantage = compute_gae_from_node(node)
 
@@ -859,15 +918,16 @@ class RLSPTrainer(Trainer):
         self.replay_buffer.update_priorities(indices, new_priorities)
 
     def train(self, num_iterations, beta_start=0.4, beta_frames=100000, **kwargs):
+        manual_seed(os.getpid())
         frame_idx = 1
         beta = beta_start
         for iteration in range(num_iterations):
             print(f"Starting iteration {iteration + 1}/{num_iterations}")
-
-            # Self-play to collect new experiences
-            initial_state = self.envoirment.sample_initial_state()
-            root_node = self.self_play(initial_state)
-            self.collect_experience(root_node)
+            if self.accelerator.is_main_process:
+                # Self-play to collect new experiences
+                initial_state = self.envoirment.sample_initial_state()
+                root_node = self.self_play(initial_state)
+                self.collect_experience(root_node)
 
 
 
@@ -897,7 +957,7 @@ class RLSPTrainer(Trainer):
                 collate_fn=self.data_collator,
             )
             train_dataloader = self.accelerator.prepare(train_dataloader)
-
+            self.accelerator.wait_for_everyone()
             # Training loop
             for step, inputs in enumerate(train_dataloader):
                 self.model.train()
@@ -993,7 +1053,7 @@ import torch
 # 假设您已经定义了 TreeNode、MCTS 和 RLSPTrainer 类
 
 # 加载模型和 tokenizer
-model_name = "/mnt/hwfile/ai4chem/CKPT/longcot_pt_GEMMA_ZD_10_23_1"
+model_name = "google/gemma-2-2b-it"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModelForCausalLM.from_pretrained(
     model_name, torch_dtype=torch.bfloat16,
@@ -1020,8 +1080,8 @@ print("Model successfully converted to LoRA format.")
 
 
 # 初始状态和 MCTS 参数
-num_simulations = 32
-num_candidates_per_expansion = 1
+num_simulations = 96
+num_candidates_per_expansion = 2
 exploration_const = 1.4
 discount_factor = 0.9
 reward_epsilon = 1e-6
