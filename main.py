@@ -5,8 +5,6 @@ import math
 import random
 import re
 import datasets
-from py import log
-from scipy import optimize
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, SinkCache
 import torch
