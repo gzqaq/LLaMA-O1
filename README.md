@@ -3,9 +3,9 @@ Large Reasoning Models powered by Monte Carlo Tree Search (MCTS), Self-Play Rein
 ![alt text](image-1.png)
 ## Contributors Calling！
 ### Known issues
-[ ] limited Sampling speed
+[] limited Sampling speed
 
-[ ] Deepspeed initialization bug
+[] Deepspeed initialization bug
 ## Tutorials
 TBD
 ## Datasets
