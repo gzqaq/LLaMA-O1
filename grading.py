@@ -1,5 +1,7 @@
 from functools import lru_cache
 import re
+import warnings
+warnings.filterwarnings("ignore")
 
 from numpy import extract
 import openai
@@ -369,6 +371,8 @@ def check_label(gt_label,ans_label):
     openai_criteria = openai_is_equiv(ans_label,gt_label)
     # print(gt_label,ans_label)
     literal_criteria_0 = gt_label is None or ans_label is None
+    if literal_criteria_0:
+        return None
 
     literal_criteria_1 = ans_label == gt_label
     try: 

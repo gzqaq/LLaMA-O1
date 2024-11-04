@@ -111,7 +111,7 @@ meta_action_type_to_index = {meta: i for i, meta in enumerate(meta_action_types)
 
 
 LN_2 = 0.69314718056  # ln(2) = 1.0 / LOG2_E
-GENERATE_MAX_NEW_TOKENS = 256
+GENERATE_MAX_NEW_TOKENS = 64
 CUT_OFF_LEN = 1024
 MAX_CHILDREN_NUM = 5
 
@@ -311,12 +311,13 @@ class MCTS:
             node.add_child(child_node)
             child_node.value = self.compute_value(child_node)
             child_node.meta = meta
-            if child_node.meta == "<conclusion>":
-                if self.envoirment.compute_rule_orm_head(child_node):
-                    self.patient -= 1
-                    child_node.leaf_type = "successful"
-                else:
-                    child_node.leaf_type = "failed"
+            # if child_node.meta == "<conclusion>":
+            orm = self.envoirment.compute_rule_orm_head(child_node)
+            if orm == True:
+                self.patient -= 1
+                child_node.leaf_type = "successful"
+            elif orm == False:
+                child_node.leaf_type = "failed"            
             print(
                 f"Id:{node.index}->{child_node.index}, Child: {text}, Policy: {node.get_child_policy_prob(child_node)}, Value: {math.exp(child_node.value)}"
             )
@@ -347,9 +348,8 @@ class MCTS:
 
     def identify_leaf(self, node):
         result = set()
-        if node.is_leaf():
-            if node.leaf_type in ["successful", "failed"]:
-                result.add(node)
+        if node.is_leaf() or node.leaf_type in ["successful", "failed"]:
+            result.add(node)
         else:
             for child in node.children:
                 result |= self.identify_leaf(child)
@@ -804,8 +804,6 @@ class RLSPTrainer(Trainer):
         for node in traverse_tree(root_node):
             if node == root_node:
                 continue
-            if node.true_value_from_tree is None:
-                continue
             reward = node.true_value_from_tree if node.true_value_from_tree is not None else node.value
             advantage = compute_gae_from_node(node)
 
@@ -923,13 +921,12 @@ class RLSPTrainer(Trainer):
         beta = beta_start
         for iteration in range(num_iterations):
             print(f"Starting iteration {iteration + 1}/{num_iterations}")
-            if self.accelerator.is_main_process:
-                # Self-play to collect new experiences
-                initial_state = self.envoirment.sample_initial_state()
-                root_node = self.self_play(initial_state)
-                self.collect_experience(root_node)
 
 
+            # Self-play to collect new experiences
+            initial_state = self.envoirment.sample_initial_state()
+            root_node = self.self_play(initial_state)
+            self.collect_experience(root_node)
 
             # Anneal beta over time to 1.0
             beta = min(1.0, beta_start + frame_idx * (1.0 - beta_start) / beta_frames)
@@ -969,7 +966,7 @@ class RLSPTrainer(Trainer):
                 self.accelerator.backward(loss)
                 self.optimizer.step()
                 self.optimizer.zero_grad()
-
+                self.accelerator.wait_for_everyone()
                 # Update priorities in the replay buffer
                 # For simplicity, we use the absolute value of the loss as the TD-error
                 indices = inputs['indices'].cpu().numpy()
@@ -1045,7 +1042,7 @@ class Environment:
             result = check(ground_truth, node.state, "")
             return result
         except:
-            return False
+            return None
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, AdamW
 import torch
@@ -1053,7 +1050,7 @@ import torch
 # 假设您已经定义了 TreeNode、MCTS 和 RLSPTrainer 类
 
 # 加载模型和 tokenizer
-model_name = "google/gemma-2-2b-it"
+model_name = "/mnt/hwfile/ai4chem/CKPT/longcot_pt_GEMMA_ZD_10_23_1"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModelForCausalLM.from_pretrained(
     model_name, torch_dtype=torch.bfloat16,
@@ -1080,7 +1077,7 @@ print("Model successfully converted to LoRA format.")
 
 
 # 初始状态和 MCTS 参数
-num_simulations = 96
+num_simulations = 16
 num_candidates_per_expansion = 2
 exploration_const = 1.4
 discount_factor = 0.9
@@ -1088,13 +1085,13 @@ reward_epsilon = 1e-6
 
 from datasets import load_dataset
 
-# ds = load_dataset("openai/gsm8k", "main")['train']
+ds = load_dataset("openai/gsm8k", "main")['train']
 
-# problems = [{"problem": p['question'], "ground_truth": p['answer']} for p in ds]
+problems = [{"problem": p['question'], "ground_truth": p['answer']} for p in ds]
 
-ds = load_dataset("lighteval/MATH", "all")['train']
+# ds = load_dataset("lighteval/MATH", "all")['train']
 
-problems = [{"problem": p['problem'], "ground_truth": p['solution']} for p in ds]
+# problems = [{"problem": p['problem'], "ground_truth": p['solution']} for p in ds]
 
 envoirment = Environment(problems)
 
@@ -1126,8 +1123,8 @@ accelerator = trainer.accelerator
 model = model.to(accelerator.device)
 
 # 设置训练轮数和批次大小
-num_iterations = 8
+num_iterations = 1
 
 # 执行训练
 trainer.train(num_iterations=num_iterations)
-trainer.save_model("./checkpoint-1")
+model.save_pretrained('./output')
