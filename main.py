@@ -14,7 +14,7 @@ import torch.optim as optim
 import numpy as np
 from torch.nn.utils.rnn import pad_sequence
 
-from transformers import StoppingCriteria, StoppingCriteriaList
+from transformers import StoppingCriteria, StoppingCriteriaList, Trainer, TrainingArguments
 from typing import List
 import torch
 
@@ -277,7 +277,7 @@ class MCTS:
                 child.value
                 + self.exploration_const
                 * node.get_child_policy_prob(child)
-                * node.get_child_policy_entropy(child)
+                # * node.get_child_policy_entropy(child)
                 * np.sqrt(total_visits)
                 / (1 + child.visits)
                 + self.varentropy_lambda * node.get_child_policy_varentropy(child)
@@ -716,10 +716,11 @@ class PrioritizedReplayBuffer:
 
 
 class RLSPTrainer(Trainer):
-    def __init__(self, envoirment, model, tokenizer, mcts, replay_buffer_capacity=100000, **kwargs):
+    def __init__(self, envoirment, model, tokenizer, mcts, replay_buffer_capacity, args, **kwargs):
         super().__init__(
             model=model,
-            tokenizer=tokenizer,
+            processing_class=tokenizer,
+            args=args,
             **kwargs
         )
         self.envoirment = envoirment
@@ -729,6 +730,7 @@ class RLSPTrainer(Trainer):
         self.replay_buffer_file = 'replay_buffer.pkl'
         self.replay_buffer.load(self.replay_buffer_file)  # Load existing buffer
         self.create_optimizer_and_scheduler(9999)
+        self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
 
     def self_play(self, initial_state):
         self.model.eval()
@@ -749,9 +751,6 @@ class RLSPTrainer(Trainer):
             advantage = compute_gae_from_node(node)
 
             policy_input = tokenize_policy_predict([node,], self.tokenizer)
-            # Old policy probabilities
-            with torch.no_grad():
-                old_policy_log_probs = forward_policy_predict(self.model.get_base_model(), self.tokenizer, policy_input)
 
             advantage_tensor = torch.tensor([advantage], dtype=torch.float32).unsqueeze(0)
             value_input = tokenize_value_predict(node, self.tokenizer)
@@ -759,7 +758,6 @@ class RLSPTrainer(Trainer):
 
             # Store the experience with initial priority
             experience = {
-                'old_policy_log_probs': old_policy_log_probs,
                 'advantage': advantage_tensor,
                 'value_target': value_target,
                 **policy_input,
@@ -773,7 +771,6 @@ class RLSPTrainer(Trainer):
         """Sample a batch from the replay buffer using PER."""
         # Prepare data for the model
         data = {
-            'old_policy_log_probs': [],
             'advantage': [],
             'value_target': [],
             'input_ids':[],
@@ -793,7 +790,6 @@ class RLSPTrainer(Trainer):
                 return None  # Not enough samples to create a batch
 
             for sample in samples:
-                data['old_policy_log_probs'].append(sample.get('old_policy_log_probs', 0))
                 data['advantage'].append(sample.get('advantage', 0))
                 data['value_target'].append(sample.get('value_target', 0))
                 data['input_ids'].append(sample.get('input_ids', 0))
@@ -813,7 +809,8 @@ class RLSPTrainer(Trainer):
 
         # Compute policy loss using PPO
         new_policy_log_probs = forward_policy_predict(self.model, self.tokenizer, inputs)
-        old_policy_log_probs = inputs['old_policy_log_probs']
+        with torch.no_grad():
+            old_policy_log_probs = forward_policy_predict(self.model.get_base_model(), self.tokenizer, inputs).detach()
         target_mask = inputs['target_attention_mask']
         advantage = inputs['advantage']
         epsilon = 0.2  # PPO clip parameter
@@ -838,7 +835,6 @@ class RLSPTrainer(Trainer):
         value_loss = F.binary_cross_entropy_with_logits(
             value_prediction, target_probs.to(self.accelerator.device)
         )
-
 
         # Combine losses
         total_loss = policy_loss + value_loss
@@ -900,6 +896,7 @@ class RLSPTrainer(Trainer):
                 shuffle=True,  # PER handles sampling
                 collate_fn=self.data_collator,
             )
+            train_dataloader = self.accelerator.prepare(train_dataloader)
 
             # Training loop
             for step, inputs in enumerate(train_dataloader):
@@ -917,6 +914,7 @@ class RLSPTrainer(Trainer):
                 # For simplicity, we use the absolute value of the loss as the TD-error
                 indices = inputs['indices'].cpu().numpy()
                 self.update_priorities(indices, td_errors)
+                self.accelerator.wait_for_everyone()
 
             print(f"Iteration {iteration + 1}/{num_iterations} completed.")
 
@@ -995,10 +993,11 @@ import torch
 # 假设您已经定义了 TreeNode、MCTS 和 RLSPTrainer 类
 
 # 加载模型和 tokenizer
-model_name = "qq8933/OpenLongCoT-Base-Gemma2-2B"
+model_name = "/mnt/hwfile/ai4chem/CKPT/longcot_pt_GEMMA_ZD_10_23_1"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModelForCausalLM.from_pretrained(
-    model_name, torch_dtype=torch.bfloat16
+    model_name, torch_dtype=torch.bfloat16,
+    use_cache=True
 )
 
 # 设置 LoRA 配置
@@ -1051,6 +1050,8 @@ mcts = MCTS(
     reward_epsilon=reward_epsilon
 )
 
+args = TrainingArguments(gradient_accumulation_steps=32,per_device_train_batch_size=4,output_dir='./output')
+
 # 创建 RLSPTrainer 实例
 trainer = RLSPTrainer(
     envoirment=envoirment,
@@ -1058,6 +1059,7 @@ trainer = RLSPTrainer(
     tokenizer=tokenizer,
     mcts=mcts,
     replay_buffer_capacity=100000,
+    args=args,
 )
 
 accelerator = trainer.accelerator
